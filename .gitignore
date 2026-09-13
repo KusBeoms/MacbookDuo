@@ -1,0 +1,19 @@
+# SwiftPM build products
+.build/
+.swiftpm/
+Package.resolved
+
+# App bundle produced by build-app.sh
+build/
+
+# Xcode (if the package is ever opened there)
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# oh-my-claudecode session state
+.omc/
+
+# macOS
+.DS_Store
