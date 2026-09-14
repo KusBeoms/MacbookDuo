@@ -14,25 +14,37 @@ final class ScreenFreezer: NSObject {
     /// been superseded tears its own stream down instead of leaking it.
     private var generation = 0
 
-    nonisolated private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private let sampleQueue = DispatchQueue(label: "com.macbookduo.capture")
 
     /// `latest` is only ever touched while `latestLock` is held; that lock is the entire
     /// reason this is safe to read from the sample queue and the main actor alike.
+    /// The raw IOSurface-backed buffer is kept rather than a CGImage: converting every frame
+    /// would read the full display back off the GPU several times a second, when only the
+    /// one frame the fold actually starts on is ever used.
     nonisolated private let latestLock = NSLock()
-    nonisolated(unsafe) private var latest: CGImage?
+    nonisolated(unsafe) private var latest: CVPixelBuffer?
     nonisolated(unsafe) private var latestTime: TimeInterval = 0
+    /// Whether `latest` was delivered by the stream that is running now. An idle report
+    /// only vouches for the current stream's own last image; a frame kept over from an
+    /// earlier stream must not have its age refreshed, or it could never expire.
+    nonisolated(unsafe) private var latestFromCurrentStream = false
 
     private(set) var isRunning = false
 
     /// The most recent clean frame, or nil when there is none recent enough to trust.
     /// A stale frame would put content back on screen that the user has since moved past.
-    nonisolated var frozenFrame: CGImage? {
+    nonisolated var frozenFrame: CVPixelBuffer? {
         latestLock.lock()
         defer { latestLock.unlock() }
         guard let latest, ProcessInfo.processInfo.systemUptime - latestTime < Config.maxFrameAge
         else { return nil }
         return latest
+    }
+
+    nonisolated private func markFrameFromPreviousStream() {
+        latestLock.lock()
+        latestFromCurrentStream = false
+        latestLock.unlock()
     }
 
     nonisolated private func clearFrame() {
@@ -45,6 +57,7 @@ final class ScreenFreezer: NSObject {
     func start(displayID: CGDirectDisplayID, pixelScale: Double) async {
         guard !isRunning else { return }
         isRunning = true
+        markFrameFromPreviousStream()
         generation += 1
         let myGeneration = generation
 
@@ -125,16 +138,32 @@ extension ScreenFreezer: SCStreamDelegate {
 
 extension ScreenFreezer: SCStreamOutput {
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen,
-              CMSampleBufferGetNumSamples(sampleBuffer) > 0,
-              CMSampleBufferIsValid(sampleBuffer),
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+        guard type == .screen, CMSampleBufferIsValid(sampleBuffer),
+              let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+                as? [[SCStreamFrameInfo: Any]],
+              let rawStatus = attachments.first?[.status] as? Int,
+              let status = SCFrameStatus(rawValue: rawStatus)
         else { return }
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
-        latestLock.lock()
-        latest = cgImage
-        latestTime = ProcessInfo.processInfo.systemUptime
-        latestLock.unlock()
+
+        switch status {
+        case .complete, .started:
+            guard CMSampleBufferGetNumSamples(sampleBuffer) > 0,
+                  let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+            else { return }
+            latestLock.lock()
+            latest = pixelBuffer
+            latestTime = ProcessInfo.processInfo.systemUptime
+            latestFromCurrentStream = true
+            latestLock.unlock()
+        case .idle:
+            // Nothing on screen changed, so no image is sent — but the frame already held
+            // is still exactly what is displayed. Without refreshing its age here, a still
+            // screen would age the frame out and the next fold would have nothing to freeze.
+            latestLock.lock()
+            if latest != nil, latestFromCurrentStream { latestTime = ProcessInfo.processInfo.systemUptime }
+            latestLock.unlock()
+        default:
+            return
+        }
     }
 }
