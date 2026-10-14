@@ -64,10 +64,10 @@ final class FoldPlateView: NSView {
         // where it sits on the real screen. Nothing about this is a vertical gradient: the
         // top blurs more because it swings through a wider arc, and the sides blur more
         // because perspective moves them further, both of which fall out of the geometry.
-        // The filter is only attached while there is blur to draw (see `setBlurRadius`):
-        // even at radius 0 it would push the whole enlarged plate through Core Image on
-        // every frame.
-        blurFilter?.setValue(0.0, forKey: "inputRadius")
+        if let blurFilter {
+            blurFilter.setValue(0.0, forKey: "inputRadius")
+            plateLayer.filters = [blurFilter]
+        }
         plateLayer.zPosition = 0
 
         layoutLayers()
@@ -159,13 +159,6 @@ final class FoldPlateView: NSView {
                 y: size.height / image.extent.height
             )
             blurFilter?.setValue(image.transformed(by: fit), forKey: "inputMask")
-            // A filter already attached is a snapshot; re-attach so it picks up the new mask.
-            if let blurFilter, plateLayer.filters?.isEmpty == false {
-                if let radius = plateLayer.value(forKeyPath: "filters.CIMaskedVariableBlur.inputRadius") {
-                    blurFilter.setValue(radius, forKey: "inputRadius")
-                }
-                plateLayer.filters = [blurFilter]
-            }
         }
     }
 
@@ -288,33 +281,24 @@ final class FoldPlateView: NSView {
     /// Clamping the edge is what makes this read as the screen extending rather than as a
     /// second, larger copy laid over it.
     func setFrozenImage(_ image: CGImage) {
-        setPlateContents(extended(CIImage(cgImage: image)) ?? image)
-    }
-
-    /// Captured frames arrive as GPU-backed buffers. Extending straight from the buffer
-    /// renders the plate in a single pass, instead of reading the frame back to a CGImage
-    /// and then uploading and reading it back a second time to extend it.
-    func setFrozenImage(_ pixelBuffer: CVPixelBuffer) {
-        let image = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let contents = extended(image) ?? ciContext.createCGImage(image, from: image.extent)
-        else { return }
-        setPlateContents(contents)
-    }
-
-    private func setPlateContents(_ contents: CGImage) {
+        let contents = extended(image) ?? image
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         plateLayer.contents = contents
         CATransaction.commit()
     }
 
-    private func extended(_ image: CIImage) -> CGImage? {
+    private func extended(_ image: CGImage) -> CGImage? {
         guard bounds.width > 0 else { return nil }
-        let extent = image.extent
-        let pixelsPerPoint = Double(extent.width) / Double(bounds.width)
+        let pixelsPerPoint = Double(image.width) / Double(bounds.width)
         let margin = Config.edgeExtension * pixelsPerPoint
-        let region = extent.insetBy(dx: -margin, dy: -margin)
-        return ciContext.createCGImage(image.clampedToExtent(), from: region)
+        let clamped = CIImage(cgImage: image).clampedToExtent()
+        let region = CGRect(
+            x: -margin, y: -margin,
+            width: Double(image.width) + 2 * margin,
+            height: Double(image.height) + 2 * margin
+        )
+        return ciContext.createCGImage(clamped, from: region)
     }
 
     /// Drives the transition. `travelDegrees` is how far the lid has moved from the angle
@@ -349,25 +333,8 @@ final class FoldPlateView: NSView {
         let blur = min(displaced * Config.blurPerPointOfDisplacement, Config.maxBlurRadius)
 
         plateLayer.transform = transform
-        setBlurRadius(blur)
+        plateLayer.setValue(blur, forKeyPath: "filters.CIMaskedVariableBlur.inputRadius")
         backdropLayer.opacity = Float(backdrop)
         CATransaction.commit()
-    }
-
-    /// Below this radius the blur is invisible, so the filter is detached altogether.
-    private static let blurCutoff = 0.05
-
-    private func setBlurRadius(_ radius: Double) {
-        guard let blurFilter else { return }
-        let attached = plateLayer.filters?.isEmpty == false
-        if radius < FoldPlateView.blurCutoff {
-            if attached { plateLayer.filters = nil }
-        } else if attached {
-            plateLayer.setValue(radius, forKeyPath: "filters.CIMaskedVariableBlur.inputRadius")
-        } else {
-            // Attaching snapshots the filter, so the current radius and mask go in first.
-            blurFilter.setValue(radius, forKey: "inputRadius")
-            plateLayer.filters = [blurFilter]
-        }
     }
 }

@@ -21,8 +21,6 @@ final class FoldController {
     private var resolveStartedAt: TimeInterval = 0
     private var hasStopped = false
     private var lastCaptureRetry: TimeInterval = 0
-    /// Screen Recording is missing, so polling drops to `noAccessPollHz` until it is granted.
-    private var waitingForAccess = false
     /// Stands in for a captured frame so the rendering can be exercised without Screen
     /// Recording access. Debug only.
     var debugFrame: CGImage?
@@ -32,8 +30,7 @@ final class FoldController {
     /// The angle the plate is actually drawn at. It chases the measured travel rather than
     /// snapping to it, which is what turns the sensor's whole-degree reports into motion.
     private var renderedTravel: Double = 0
-    /// Turns the sensor's ten-a-second reports into an angle that moves every frame.
-    private var reconstructor = AngleReconstructor()
+    private var lastTickTime: TimeInterval = 0
 
     /// When set, `tick` uses this angle instead of the sensor. Used by the preview demo.
     private var demoAngle: Double?
@@ -178,10 +175,7 @@ final class FoldController {
         timer = nil
         guard let hz else { return }
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        // Tight timing only matters while animating. At rest a generous leeway lets the
-        // system coalesce these wakeups with others, which is most of the idle power cost.
-        let leeway: DispatchTimeInterval = hz >= Config.activePollHz ? .milliseconds(1) : .milliseconds(15)
-        timer.schedule(deadline: .now(), repeating: 1.0 / hz, leeway: leeway)
+        timer.schedule(deadline: .now(), repeating: 1.0 / hz, leeway: .milliseconds(1))
         timer.setEventHandler { [weak self] in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -204,33 +198,12 @@ final class FoldController {
 
         // If capture is not running — permission was granted after launch, or the stream
         // was torn down — bring it back rather than sitting enabled but inert.
-        // The throttle is checked first so the permission query runs at most every 5 s.
-        if waitingForAccess, freezer.isRunning {
-            // Capture was brought up by another path (wake, screen change, re-enable) after
-            // the grant. The retry below never runs while capture is up, so clear the flag
-            // here or the effect would stay throttled to 1 Hz with a live stream.
-            waitingForAccess = false
-            if let live = sensor.readAngle() { tracker.reanchor(to: live) }
-        }
-        if !plateIsVisible, !freezer.isRunning {
+        if !plateIsVisible, !freezer.isRunning, hasScreenAccess {
             let now = CACurrentMediaTimeShim()
             if now - lastCaptureRetry > 5 {
                 lastCaptureRetry = now
-                let access = hasScreenAccess
-                if access { Task { await self.startCapture() } }
-                let wasWaiting = waitingForAccess
-                waitingForAccess = !access && debugFrame == nil
-                // The lid may have moved a long way while unpolled; that is not a fold.
-                if wasWaiting, !waitingForAccess, let live = sensor.readAngle() {
-                    tracker.reanchor(to: live)
-                }
+                Task { await self.startCapture() }
             }
-        }
-        // Without Screen Recording there is nothing to freeze, so reading the sensor at the
-        // idle rate would be pure cost. Tick just often enough to notice the grant.
-        if waitingForAccess, demoAngle == nil {
-            setPollRate(Config.noAccessPollHz)
-            return
         }
 
         guard let angle = demoAngle ?? sensor.readAngle() else { return }
@@ -250,7 +223,7 @@ final class FoldController {
                 // started would drop the plate in already tilted and blurred.
                 tracker.rebaseAnchor(to: angle)
                 renderedTravel = 0
-                reconstructor.reset(to: 0, now: CACurrentMediaTimeShim())
+                lastTickTime = 0
                 overlay?.plateView.apply(strength: 0, travelDegrees: 0)
                 lastStrength = 0
             }
@@ -280,12 +253,17 @@ final class FoldController {
         setPollRate(animating ? Config.activePollHz : Config.idlePollHz)
     }
 
-    private func smoothedTravel(toward measured: Double) -> Double {
-        renderedTravel = reconstructor.update(
-            measured: measured,
-            now: CACurrentMediaTimeShim(),
-            prediction: Config.anglePrediction
-        )
+    /// Exponential ease toward the measured travel, framerate independent.
+    private func smoothedTravel(toward target: Double) -> Double {
+        let now = CACurrentMediaTimeShim()
+        let elapsed = lastTickTime > 0 ? now - lastTickTime : 0
+        lastTickTime = now
+        guard elapsed > 0, Config.angleSmoothing > 0 else {
+            renderedTravel = target
+            return target
+        }
+        let factor = 1 - exp(-elapsed / Config.angleSmoothing)
+        renderedTravel += (target - renderedTravel) * min(1, factor)
         return renderedTravel
     }
 
@@ -334,9 +312,6 @@ final class FoldController {
         }
         setPollRate(nil)
         overlay?.plateView.apply(strength: strength, travelDegrees: travel)
-        if let spin = ProcessInfo.processInfo.environment["DUO_SPIN"].flatMap(Double.init) {
-            runSpin(seconds: spin, amplitude: travel, strength: strength)
-        }
         // Always time-limited: an opaque overlay held open by a debug flag would otherwise
         // have no way out.
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
@@ -349,60 +324,19 @@ final class FoldController {
         }
     }
 
-    /// Debug: sweeps the plate back and forth continuously and reports how steadily the
-    /// updates were delivered, so rendering cost can be measured over a sustained run.
-    private var spinTimer: DispatchSourceTimer?
-    private func runSpin(seconds: Double, amplitude: Double, strength: Double) {
-        let began = CACurrentMediaTimeShim()
-        var last = 0.0
-        var intervals: [Double] = []
-        var costs: [Double] = []
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now(), repeating: 1.0 / Config.activePollHz, leeway: .milliseconds(1))
-        timer.setEventHandler { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                let now = CACurrentMediaTimeShim()
-                if last > 0 { intervals.append(now - last) }
-                last = now
-                let t = now - began
-                let travel = amplitude * (0.5 - 0.5 * cos(2 * .pi * t / 1.2))
-                self.overlay?.plateView.apply(strength: strength, travelDegrees: travel)
-                CATransaction.flush()
-                costs.append(CACurrentMediaTimeShim() - now)
-                if t >= seconds {
-                    self.spinTimer?.cancel()
-                    self.spinTimer = nil
-                    func stats(_ v: [Double]) -> String {
-                        let s = v.sorted()
-                        return String(format: "med %.1f p90 %.1f max %.1f", s[s.count / 2] * 1000, s[Int(Double(s.count) * 0.9)] * 1000, s.last! * 1000)
-                    }
-                    NSLog("MacbookDuo: spin frames=\(costs.count) late=\(intervals.filter { $0 > 0.0208 }.count) interval ms [\(stats(intervals))] apply ms [\(stats(costs))]")
-                }
-            }
-        }
-        timer.resume()
-        spinTimer = timer
-    }
-
     // MARK: - Plate lifecycle
 
     private func showPlate() {
         guard !plateIsVisible, let overlay else { return }
         // Without a captured frame there is nothing to freeze; stay out of the way.
-        if let debugFrame {
-            overlay.plateView.setFrozenImage(debugFrame)
-        } else if let frame = freezer.frozenFrame {
-            overlay.plateView.setFrozenImage(frame)
-        } else {
-            return
-        }
+        guard let frame = debugFrame ?? freezer.frozenFrame else { return }
+        overlay.plateView.setFrozenImage(frame)
         overlay.plateView.apply(strength: 0, travelDegrees: 0)
         overlay.alphaValue = 1
         overlay.orderFrontRegardless()
         plateIsVisible = true
         renderedTravel = 0
-        reconstructor.reset(to: 0, now: CACurrentMediaTimeShim())
+        lastTickTime = 0
         lastPlateMotion = CACurrentMediaTimeShim()
         Task { await self.freezer.stop() }
     }
@@ -450,6 +384,7 @@ final class FoldController {
             overlay.alphaValue = 0
             plateIsVisible = false
             isResolving = false
+            lastTickTime = 0
             Task { await self.startCapture() }
         }
     }
@@ -458,9 +393,6 @@ final class FoldController {
     /// driving the plate that is already up, rather than uncovering the screen mid-move.
     private func abortResolve() {
         isResolving = false
-        // Continue from wherever the return had got to, rather than snapping to the new
-        // measurement.
-        reconstructor.reset(to: renderedTravel, now: CACurrentMediaTimeShim())
         overlay?.plateView.cancelAnimations()
         overlay?.alphaValue = 1
     }

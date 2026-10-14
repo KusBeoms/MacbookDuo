@@ -7,18 +7,14 @@ import Foundation
 /// with fold progress (peaking around 72 source pixels), and a darkening pass runs at
 /// roughly twice the transition strength.
 enum Config {
-    /// How far ahead of the lid sensor's reports the angle is drawn, from 0 to 1. The sensor
-    /// only reports ten times a second, so the content either trails the lid by up to one
-    /// report interval (0: never overshoots) or runs ahead along the latest motion (1: keeps
-    /// up, but coasts past the lid by up to one interval on an abrupt stop). At 90 deg/s,
-    /// 0.5 trails by about 5 degrees and overshoots a sudden stop by about 4.
-    static let anglePrediction: Double = 0.5
+    /// Time constant for easing the rendered angle toward the measured one. The sensor
+    /// reports whole degrees, so without this the frozen frame would advance in visible
+    /// one-degree steps instead of gliding.
+    static let angleSmoothing: TimeInterval = 0.075
 
     /// Sensor poll rate while the lid is moving / at rest.
     static let activePollHz: Double = 60
     static let idlePollHz: Double = 20
-    /// Poll rate while Screen Recording has not been granted and the effect cannot run.
-    static let noAccessPollHz: Double = 1
 
     /// A single sample may not jump further than this. The lid cannot physically swing
     /// this fast, so a larger step is a glitched report and is discarded.
@@ -44,8 +40,7 @@ enum Config {
     /// Ceiling on the blur radius, in points. The radius itself comes from how far a pixel
     /// has actually been displaced from where it sits on the real screen, so this is only a
     /// safety limit for very wide folds.
-    static let maxBlurRadius: Double =
-        ProcessInfo.processInfo.environment["DUO_MAXBLUR"].flatMap(Double.init) ?? 110
+    static let maxBlurRadius: Double = 110
 
     /// Blur radius per point of displacement. A pixel that has not moved is not blurred at
     /// all, which is what makes a lid held near its original angle stay crisp everywhere.
